@@ -16,12 +16,18 @@ public final class Alert {
     private final Instant openedAt;
     private final Instant resolvedAt;
     private final List<AlertTransition> transitions;
+    /**
+     * 已处理批次中最晚的业务时点水位。
+     * 业务时点不晚于该水位的迟到批次不得再翻转（打开/关闭）本告警，只能留下抑制记录。
+     */
+    private final Instant watermarkBusinessTime;
 
     public Alert(String alertKey, String ruleId, AlertState state,
                  String firstBatchId, String lastBatchId,
                  int occurrenceCount, int openCount,
                  Instant openedAt, Instant resolvedAt,
-                 List<AlertTransition> transitions) {
+                 List<AlertTransition> transitions,
+                 Instant watermarkBusinessTime) {
         this.alertKey = alertKey;
         this.ruleId = ruleId;
         this.state = state;
@@ -32,6 +38,17 @@ public final class Alert {
         this.openedAt = openedAt;
         this.resolvedAt = resolvedAt;
         this.transitions = transitions;
+        this.watermarkBusinessTime = watermarkBusinessTime;
+    }
+
+    /** 兼容旧签名：无业务时点水位（由状态机在流转时补齐）。 */
+    public Alert(String alertKey, String ruleId, AlertState state,
+                 String firstBatchId, String lastBatchId,
+                 int occurrenceCount, int openCount,
+                 Instant openedAt, Instant resolvedAt,
+                 List<AlertTransition> transitions) {
+        this(alertKey, ruleId, state, firstBatchId, lastBatchId, occurrenceCount, openCount,
+                openedAt, resolvedAt, transitions, null);
     }
 
     public String getAlertKey() { return alertKey; }
@@ -44,4 +61,5 @@ public final class Alert {
     public Instant getOpenedAt() { return openedAt; }
     public Instant getResolvedAt() { return resolvedAt; }
     public List<AlertTransition> getTransitions() { return transitions; }
+    public Instant getWatermarkBusinessTime() { return watermarkBusinessTime; }
 }

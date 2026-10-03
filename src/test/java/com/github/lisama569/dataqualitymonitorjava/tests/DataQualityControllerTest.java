@@ -79,6 +79,17 @@ class DataQualityControllerTest {
                 "rows", rows));
     }
 
+    /** 携带业务时点的批次 JSON。 */
+    private String batchJson(String bid, String cid, String businessTime,
+                             List<Map<String, String>> rows) throws Exception {
+        return om.writeValueAsString(Map.of(
+                "batchId", bid,
+                "contractId", cid,
+                "submittedAt", "2026-10-01T05:00:00Z",
+                "businessTime", businessTime,
+                "rows", rows));
+    }
+
     @Test
     @DisplayName("完整链路：登记契约规则 -> 批次通过 -> 重复提交幂等返回")
     void happyPathAndDuplicate() throws Exception {
@@ -195,5 +206,82 @@ class DataQualityControllerTest {
         mockMvc.perform(get("/api/alerts"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$[?(@.ruleId=='r-id')].state").value(org.hamcrest.Matchers.hasItem("OPEN")));
+    }
+
+    @Test
+    @DisplayName("业务时点+显式判定时刻：陈旧批次 FAILED，结论回显业务时点与判定时刻")
+    void staleBusinessTimeFailsWithExplicitJudgedAt() throws Exception {
+        String cid = "it-contract-fresh-1";
+        registerContract(cid);
+        registerRule(cid, "r-fresh", "FRESHNESS", null, null, null, 3600L);
+        String body = batchJson("it-fresh-stale", cid, "2026-10-01T00:00:00Z",
+                List.of(Map.of("id", "1", "status", "NEW")));
+
+        // 业务 00:00、判定 03:00 -> 滞后 3h 越界
+        mockMvc.perform(post("/api/batches?judgedAt=2026-10-01T03:00:00Z")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("FAILED"))
+                .andExpect(jsonPath("$.businessTime").value("2026-10-01T00:00:00Z"))
+                .andExpect(jsonPath("$.judgedAt").value("2026-10-01T03:00:00Z"))
+                .andExpect(jsonPath("$.outcomes[0].measured").value("10800s"))
+                .andExpect(jsonPath("$.outcomes[0].basis").isNotEmpty());
+
+        // 同一批数据若在 00:30 判定则在窗口内；重复提交返回既有陈旧结论（不随判定时刻漂移）
+        mockMvc.perform(post("/api/batches?judgedAt=2026-10-01T00:30:00Z")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("FAILED"))
+                .andExpect(jsonPath("$.duplicate").value(true))
+                .andExpect(jsonPath("$.judgedAt").value("2026-10-01T03:00:00Z"));
+    }
+
+    @Test
+    @DisplayName("judgedAt 非法时间格式返回 400 ILLEGAL_ARGUMENT")
+    void invalidJudgedAtReturns400() throws Exception {
+        String cid = "it-contract-fresh-2";
+        registerContract(cid);
+        registerRule(cid, "r-fresh", "FRESHNESS", null, null, null, 3600L);
+        String body = batchJson("it-fresh-bad-ts", cid, "2026-10-01T00:00:00Z",
+                List.of(Map.of("id", "1", "status", "NEW")));
+        mockMvc.perform(post("/api/batches?judgedAt=not-a-time")
+                        .contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error").value("ILLEGAL_ARGUMENT"));
+    }
+
+    @Test
+    @DisplayName("只读复盘接口：重算越界情况，且不改变历史批次与告警")
+    void replayEndpointIsReadOnlyAndConsistent() throws Exception {
+        String cid = "it-contract-replay";
+        registerContract(cid);
+        registerRule(cid, "r-fresh", "FRESHNESS", null, null, null, 3600L);
+        // 业务 00:00，到达即判 -> 通过
+        mockMvc.perform(post("/api/batches?judgedAt=2026-10-01T00:00:00Z")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(batchJson("it-rp-1", cid, "2026-10-01T00:00:00Z",
+                                List.of(Map.of("id", "1", "status", "NEW")))))
+                .andExpect(status().isOk()).andExpect(jsonPath("$.status").value("PASSED"));
+
+        // 在 03:00 复盘：该批次滞后 3h 越界
+        mockMvc.perform(get("/api/contracts/" + cid + "/replay")
+                        .param("judgedAt", "2026-10-01T03:00:00Z"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.contractId").value(cid))
+                .andExpect(jsonPath("$.judgedAt").value("2026-10-01T03:00:00Z"))
+                .andExpect(jsonPath("$.batchCount").value(1))
+                .andExpect(jsonPath("$.violatingBatchCount").value(1))
+                .andExpect(jsonPath("$.batches[0].violatedRuleIds[0]").value("r-fresh"))
+                .andExpect(jsonPath("$.batches[0].carriedStatus").value("PASSED"))
+                .andExpect(jsonPath("$.batches[0].freshnessOutcomes[0].basis")
+                        .value(org.hamcrest.Matchers.containsString("[复盘]")));
+
+        // 复盘未改写历史：落库结论仍是 PASSED，也没有产生任何告警
+        mockMvc.perform(get("/api/batches/it-rp-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PASSED"));
+        mockMvc.perform(get("/api/alerts"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[?(@.ruleId=='r-fresh')]").isEmpty());
     }
 }

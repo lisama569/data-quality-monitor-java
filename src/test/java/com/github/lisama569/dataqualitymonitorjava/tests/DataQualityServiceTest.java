@@ -64,7 +64,9 @@ class DataQualityServiceTest {
     // ---- 构造顺序注意：AlertService 与 service 共享同一个 storage ----
     private DataQualityService newService() {
         return new DataQualityService(storage, new ContentHasher(), new RuleValidator(),
-                new QualityEvaluator(), new AlertService(storage));
+                new QualityEvaluator(), new AlertService(storage),
+                new com.github.lisama569.dataqualitymonitorjava.service.ReplayService(
+                        storage, new QualityEvaluator()));
     }
 
     private void registerStandardContract() {
@@ -117,7 +119,7 @@ class DataQualityServiceTest {
                 null, null, null, null, 3600L));
 
         BatchResult result = service.submit(batch("b-pass", T0, List.of(
-                row(1, "NEW", "10.0"), row(2, "PAID", "20.0"))));
+                row(1, "NEW", "10.0"), row(2, "PAID", "20.0"))), T0);
         printResult(result);
 
         assertEquals(BatchStatus.PASSED, result.getStatus());

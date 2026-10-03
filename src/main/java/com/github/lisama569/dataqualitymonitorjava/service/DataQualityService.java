@@ -11,6 +11,7 @@ import com.github.lisama569.dataqualitymonitorjava.model.DataRow;
 import com.github.lisama569.dataqualitymonitorjava.model.FieldSchema;
 import com.github.lisama569.dataqualitymonitorjava.model.QualityRule;
 import com.github.lisama569.dataqualitymonitorjava.model.RejectReason;
+import com.github.lisama569.dataqualitymonitorjava.model.ReplayReport;
 import com.github.lisama569.dataqualitymonitorjava.model.RuleOutcome;
 import com.github.lisama569.dataqualitymonitorjava.storage.LocalStorage;
 import org.slf4j.Logger;
@@ -41,18 +42,28 @@ public class DataQualityService {
     private final RuleValidator ruleValidator;
     private final QualityEvaluator evaluator;
     private final AlertService alertService;
+    private final ReplayService replayService;
 
     /** 每个 batchId 一把锁，既保证同批次并发提交串行，又不阻塞不同批次。 */
     private final ConcurrentHashMap<String, Object> batchLocks = new ConcurrentHashMap<>();
 
     public DataQualityService(LocalStorage storage, ContentHasher contentHasher,
                               RuleValidator ruleValidator, QualityEvaluator evaluator,
-                              AlertService alertService) {
+                              AlertService alertService, ReplayService replayService) {
         this.storage = storage;
         this.contentHasher = contentHasher;
         this.ruleValidator = ruleValidator;
         this.evaluator = evaluator;
         this.alertService = alertService;
+        this.replayService = replayService;
+    }
+
+    /** 只读复盘：按指定过去判定时刻重算契约下批次的新鲜度结论，绝不回写任何状态。 */
+    public ReplayReport replay(String contractId, Instant judgedAt) {
+        ReplayReport report = replayService.replay(contractId, judgedAt);
+        log.info("只读复盘 contract={} judgedAt={} 批次数={} 越界批次数={}",
+                contractId, judgedAt, report.batchCount(), report.violatingBatchCount());
+        return report;
     }
 
     public DataContract registerContract(DataContract contract) {
@@ -93,6 +104,17 @@ public class DataQualityService {
     }
 
     public BatchResult submit(BatchSubmission submission) {
+        return submit(submission, null);
+    }
+
+    /**
+     * 提交批次并评估。
+     *
+     * @param judgedAt 判定时刻：新鲜度按“业务时点 -&gt; 判定时刻”的滞后判定。
+     *                 传 null 时默认取系统当前时间；复盘/测试可显式指定，
+     *                 相同（业务时点, 判定时刻）无论何时提交，结论与依据都完全一致。
+     */
+    public BatchResult submit(BatchSubmission submission, Instant judgedAt) {
         String batchId = submission.getBatchId();
         Object lock = batchLocks.computeIfAbsent(batchId, k -> new Object());
         synchronized (lock) {
@@ -107,7 +129,8 @@ public class DataQualityService {
                     // 存储中的唯一结论保持不变；仅在本次响应上标记 duplicate，便于调用方识别。
                     return new BatchResult(prior.getBatchId(), prior.getContractId(), prior.getStatus(),
                             prior.getContentHash(), true, prior.getRejections(), prior.getOutcomes(),
-                            prior.getRuleSnapshots(), prior.getEvaluatedAt());
+                            prior.getRuleSnapshots(), prior.getEvaluatedAt(),
+                            prior.getBusinessTime(), prior.getJudgedAt());
                 }
                 return reject(submission, hash, false, List.of(new BatchResult.Rejection(
                         RejectReason.DUPLICATE_ID_CONTENT_CONFLICT,
@@ -120,29 +143,34 @@ public class DataQualityService {
                 return reject(submission, hash, false, rejections);
             }
 
-            // 3. 评估（新鲜度参考时间取批次提交时间，保证历史结论可复现）。
+            // 3. 评估。判定时刻显式指定优先，缺省取系统当前时间；业务时点取自批次自身。
+            Instant effectiveJudgedAt = judgedAt != null ? judgedAt : Instant.now();
+            Instant businessTime = submission.effectiveBusinessTime();
             DataContract contract = storage.findContract(submission.getContractId()).orElseThrow();
             List<QualityRule> rules = storage.listLatestRulesForContract(submission.getContractId());
             List<RuleOutcome> outcomes =
-                    evaluator.evaluate(submission, contract, rules, submission.getSubmittedAt());
+                    evaluator.evaluate(submission, contract, rules, effectiveJudgedAt);
             boolean allPassed = outcomes.stream().allMatch(RuleOutcome::isPassed);
             BatchStatus status = allPassed ? BatchStatus.PASSED : BatchStatus.FAILED;
             BatchResult result = new BatchResult(batchId, submission.getContractId(), status, hash,
-                    false, List.of(), List.copyOf(outcomes), List.copyOf(rules), Instant.now());
+                    false, List.of(), List.copyOf(outcomes), List.copyOf(rules), Instant.now(),
+                    businessTime, effectiveJudgedAt);
             storage.saveBatch(result);
 
-            log.info("批次 {} 评估完成 status={} 命中规则数={}", batchId, status, outcomes.size());
+            log.info("批次 {} 评估完成 status={} 业务时点={} 判定时刻={} 命中规则数={}",
+                    batchId, status, businessTime, effectiveJudgedAt, outcomes.size());
             for (RuleOutcome o : outcomes) {
                 log.info("批次 {} 规则 {} v{} [{}] field={} passed={} measured={} expected={} 依据={}",
                         batchId, o.getRuleId(), o.getRuleVersion(), o.getRuleType(),
                         o.getFieldName(), o.isPassed(), o.getMeasured(), o.getExpected(), o.getBasis());
             }
 
-            // 4. 驱动告警状态流转（仅对已评估批次）。
-            List<Alert> alerts = alertService.process(result, rules);
+            // 4. 驱动告警状态流转（仅对已评估批次）；按业务时点做迟到/回填保护。
+            List<Alert> alerts = alertService.process(result, rules, businessTime);
             for (Alert a : alerts) {
-                log.info("批次 {} 告警 rule={} state={} occurrence={} openCount={}",
-                        batchId, a.getRuleId(), a.getState(), a.getOccurrenceCount(), a.getOpenCount());
+                log.info("批次 {} 告警 rule={} state={} occurrence={} openCount={} 业务水位={}",
+                        batchId, a.getRuleId(), a.getState(), a.getOccurrenceCount(),
+                        a.getOpenCount(), a.getWatermarkBusinessTime());
             }
             return result;
         }
