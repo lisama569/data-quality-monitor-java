@@ -10,6 +10,7 @@ import com.github.lisama569.dataqualitymonitorjava.model.DataContract;
 import com.github.lisama569.dataqualitymonitorjava.model.DataRow;
 import com.github.lisama569.dataqualitymonitorjava.model.DataType;
 import com.github.lisama569.dataqualitymonitorjava.model.FieldSchema;
+import com.github.lisama569.dataqualitymonitorjava.model.FreshnessReview;
 import com.github.lisama569.dataqualitymonitorjava.model.QualityRule;
 import com.github.lisama569.dataqualitymonitorjava.model.RuleType;
 import com.github.lisama569.dataqualitymonitorjava.service.DataQualityService;
@@ -21,9 +22,12 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 
 import java.time.Instant;
+import java.time.format.DateTimeParseException;
 import java.util.List;
 import java.util.Map;
 
@@ -60,7 +64,8 @@ public class DataQualityController {
     public BatchResult submitBatch(@RequestBody BatchRequest request) {
         Instant submittedAt = request.submittedAt() == null ? Instant.now() : request.submittedAt();
         List<DataRow> rows = request.rows().stream().map(DataRow::new).toList();
-        return service.submit(new BatchSubmission(request.batchId(), request.contractId(), submittedAt, rows));
+        return service.submit(new BatchSubmission(request.batchId(), request.contractId(), submittedAt,
+                request.businessTime(), request.evaluationTime(), rows));
     }
 
     @GetMapping("/batches/{batchId}")
@@ -78,6 +83,29 @@ public class DataQualityController {
     @GetMapping("/alerts")
     public List<Alert> listAlerts() {
         return service.listAlerts();
+    }
+
+    /**
+     * 只读复盘：以 at（ISO-8601，缺省取系统当前时间）为判定时刻，
+     * 重算该契约下各批次的新鲜度结论与越界情况。纯派生视图，不改写任何历史。
+     */
+    @GetMapping("/contracts/{contractId}/freshness-review")
+    public FreshnessReview reviewFreshness(@PathVariable String contractId,
+                                           @RequestParam(required = false) String at) {
+        Instant reviewTime = parseReviewTime(at);
+        return service.reviewFreshness(contractId, reviewTime);
+    }
+
+    private static Instant parseReviewTime(String at) {
+        if (at == null || at.isBlank()) {
+            return Instant.now();
+        }
+        try {
+            return Instant.parse(at.trim());
+        } catch (DateTimeParseException e) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "at 必须是 ISO-8601 时刻（如 2026-09-24T08:00:00Z），实际为: " + at);
+        }
     }
 
     /** 重置本地存储，仅供本地验证/测试使用。 */

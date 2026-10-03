@@ -10,8 +10,8 @@
 | --- | --- |
 | 数据契约 `DataContract` | 由 `contractId` 标识，包含一组有序字段声明 `FieldSchema(name, dataType, required)`，类型支持 `STRING / INTEGER / DECIMAL / BOOLEAN / TIMESTAMP`。 |
 | 质量规则 `QualityRule` | 归属于某个契约，由 `ruleId` 标识，按版本不可变存储。修改规则会产生新版本，旧版本永久保留。 |
-| 批次 `BatchSubmission` | 由调用方提供的 `batchId` 唯一标识，包含 `contractId`、`submittedAt` 与若干数据行。 |
-| 批次结论 `BatchResult` | `PASSED / FAILED / REJECTED` 三态，保存内容哈希、拒绝原因、规则级结论及**规则版本快照**。 |
+| 批次 `BatchSubmission` | 由调用方提供的 `batchId` 唯一标识，包含 `contractId`、`submittedAt`、可选的 `businessTime`（业务时点）与 `evaluationTime`（判定时刻），以及若干数据行。 |
+| 批次结论 `BatchResult` | `PASSED / FAILED / REJECTED` 三态，保存内容哈希、拒绝原因、规则级结论、**规则版本快照**，以及落库的 `businessTime` 与 `evaluatedAt`（判定时刻）。 |
 | 告警 `Alert` | 按规则维度（`alertKey = ruleId`）维护的状态机与完整流转记录。 |
 
 ### 规则（指标）类型与参数
@@ -21,10 +21,22 @@
 | `COMPLETENESS` 完整性 | `threshold ∈ [0,1]` | 有效非空（且可按契约类型解析）行数 / 总行数 `>= threshold` |
 | `UNIQUENESS` 唯一性 | `threshold ∈ [0,1]` | 字段 distinct 取值数 / 总行数 `>= threshold` |
 | `VALUE_DOMAIN` 取值域 | `allowedValues` **或** `numericMin/numericMax`（`threshold` 缺省为 1.0） | 落在允许集合/数值区间内的行数 / 总行数 `>= threshold`；数值区间只能用于 `INTEGER/DECIMAL` 字段 |
-| `FRESHNESS` 新鲜度 | 正整数 `maxAgeSeconds` | 批次提交时间相对“评估参考时间”的滞后秒数 `<= maxAgeSeconds` |
+| `FRESHNESS` 新鲜度 | 正整数 `maxAgeSeconds` | 批次**业务时点**相对**判定时刻**的滞后秒数 `<= maxAgeSeconds` |
 
-> **新鲜度可复现**：评估参考时间取批次自带的 `submittedAt`（滞后 0 秒），
-> 而不是运行时墙上时钟，因此任何历史批次无论何时复查结论都一致。
+### 新鲜度口径：业务时点与判定时刻
+
+- **业务时点 `businessTime`**：数据自身的业务时间（如订单发生日、账期），提交批次时携带；
+  缺省回退为 `submittedAt`，未升级的调用方行为不变。
+- **判定时刻 `evaluationTime`**：本次评估新鲜度的“当前时间”。缺省取**系统当前时间**；
+  调用方也可显式指定（复盘历史、写测试都必须用它）。
+- **滞后 = 判定时刻 − 业务时点**（秒），滞后 `<= maxAgeSeconds` 判为新鲜。
+  业务时点晚于判定时刻（未来数据）时滞后为负，恒在窗口内。
+- **可复现保证**：业务时点与判定时刻都会随 `BatchResult` 落库；只要这两个时刻相同，
+  无论何时重算、算多少次，结论与判定依据（`basis` 中含两个时刻与滞后秒数）完全一致，
+  不随运行时刻漂移。
+- **重复提交哈希**：内容哈希覆盖 `businessTime`；`evaluationTime` 仅在显式指定时计入哈希
+  （缺省取系统时间不计入，否则缺省提交的重复判定会永远冲突）。同一 `batchId` 以不同
+  显式判定时刻提交属于不同内容，按 `DUPLICATE_ID_CONTENT_CONFLICT` 拒绝。
 
 ## 2. 拒绝原因 vs 失败原因（严格区分，绝不静默跳过）
 
@@ -43,7 +55,8 @@
 
 ## 3. 重复批次与并发提交策略
 
-- 提交时对批次内容计算 **SHA-256 哈希**（覆盖契约、提交时间、行数/行顺序、每行排序后的键值）。
+- 提交时对批次内容计算 **SHA-256 哈希**（覆盖契约、提交时间、业务时点、行数/行顺序、
+  每行排序后的键值；显式指定的判定时刻也计入，见“新鲜度口径”）。
 - 每个 `batchId` 一把分段锁（`ConcurrentHashMap` + `synchronized`）：
   - **内容相同的重复/并发提交**：只有第一个请求真正评估，其余请求拿到**同一个既有结论对象**；
     批次表不新增记录、告警 `occurrenceCount` 不重复累计。
@@ -79,16 +92,44 @@
 - **恢复后重开**：RESOLVED 后再次失败会重新打开，`openCount + 1`；
 - 所有流转写入 `transitions`（时间、批次、from→to、说明），可追溯。
 
-## 7. REST API（本地存储）
+### 迟到与回填策略（告警业务时点水位）
+
+真实导入中业务时间与到达时间经常乱序：回填批次的业务时点可能远早于已处理的数据。
+规则是“**业务时点晚的数据说了算**”：
+
+- 每条告警维护 `businessWatermark`：最近一次驱动状态流转的批次业务时点；
+- **迟到批次**（业务时点早于水位）：批次自身照常评估、照常落库（该 FAILED 就 FAILED），
+  但**不驱动告警流转、不累计 `occurrenceCount`、不追加流转历史**——
+  已经因为更晚的数据恢复或关闭的告警，不会被迟到的旧数据重新拉成 OPEN；
+- **更晚的数据**（业务时点不早于水位）：照常走打开/合并/恢复/重开，
+  确实越界就重新打开，`openCount + 1`；
+- 迟到批次以并发或重复提交方式进入时同样只评估一次（分段锁 + 内容哈希），
+  不重复累计、结论不漂移。
+
+## 7. 新鲜度只读复盘
+
+`GET /api/contracts/{contractId}/freshness-review?at=<ISO-8601 时刻>`（`at` 缺省取系统当前时间）
+以指定时刻为判定时刻，对该契约下全部已评估批次（`REJECTED` 除外）按其落库的
+**业务时点**与**规则版本快照**重算新鲜度结论与越界情况，用于事后追溯。
+
+- **只读**：只产出派生视图（`FreshnessReview`），不改写批次结论、告警状态与流转历史；
+- **一致性**：结果完全由落库数据与 `at` 决定，不含生成时刻等运行期字段，
+  同一 `at` 重复复盘结果逐字节一致；
+- **口径**：复用与在线评估完全相同的判定函数（滞后 = `at` − 业务时点，
+  阈值取批次当时的规则快照），在线结论与复盘结论不会互相矛盾；
+- **规模**：单次复盘为内存中线性扫描，数百个批次可直接算完（有 300 批次的自动化用例）。
+
+## 8. REST API（本地存储）
 
 | 方法与路径 | 说明 |
 | --- | --- |
 | `POST /api/contracts` | 登记数据契约 |
 | `POST /api/rules` | 登记/更新规则（自动版本递增，注册时做合法性与未知指标校验） |
-| `POST /api/batches` | 提交批次（重复返回既有结论；冲突/漂移返回 422） |
-| `GET  /api/batches/{batchId}` | 查询批次结论（含规则快照与判定依据） |
+| `POST /api/batches` | 提交批次（可带 `businessTime`/`evaluationTime`；重复返回既有结论；冲突/漂移返回 422） |
+| `GET  /api/batches/{batchId}` | 查询批次结论（含规则快照、业务时点、判定时刻与判定依据） |
 | `GET  /api/batches` | 列出全部批次结论 |
 | `GET  /api/alerts` | 列出全部告警及状态 |
+| `GET  /api/contracts/{contractId}/freshness-review?at=...` | 新鲜度只读复盘（`at` 缺省取系统当前时间） |
 | `POST /api/admin/reset` | 重置本地存储（仅本地验证/测试使用） |
 
 ### curl 本地验证示例
@@ -126,9 +167,27 @@ curl -i -X POST localhost:8080/api/rules -H 'Content-Type: application/json' -d 
 
 # 7. 告警状态
 curl -s localhost:8080/api/alerts
+
+# 8. 新鲜度：登记窗口 1 小时，提交业务时点在两天前的回填批次 -> FAILED 并打开告警
+curl -s -X POST localhost:8080/api/rules -H 'Content-Type: application/json' -d '{
+  "contractId":"orders","ruleId":"r-fresh","type":"FRESHNESS","maxAgeSeconds":3600}'
+curl -s -X POST localhost:8080/api/batches -H 'Content-Type: application/json' -d '{
+  "batchId":"b-backfill","contractId":"orders",
+  "submittedAt":"2026-10-04T08:00:00Z","businessTime":"2026-10-02T08:00:00Z",
+  "rows":[{"id":"1","status":"NEW"}]}'
+
+# 9. 指定判定时刻提交（复盘/测试口径，结论不随运行时刻漂移）
+curl -s -X POST localhost:8080/api/batches -H 'Content-Type: application/json' -d '{
+  "batchId":"b-fixed","contractId":"orders",
+  "submittedAt":"2026-10-04T08:00:00Z","businessTime":"2026-10-04T07:00:00Z",
+  "evaluationTime":"2026-10-04T07:30:00Z",
+  "rows":[{"id":"2","status":"PAID"}]}'
+
+# 10. 只读复盘：以过去某个判定时刻重算该契约下各批次的新鲜度越界情况
+curl -s 'localhost:8080/api/contracts/orders/freshness-review?at=2026-10-04T08:00:00Z'
 ```
 
-## 8. 本地验证方法
+## 9. 本地验证方法
 
 ```bash
 # 运行全部测试（单元测试 + REST 集成测试 + Spring 上下文加载）
@@ -137,18 +196,24 @@ mvn test
 # 仅服务层场景测试（含 16 线程并发重复导入）
 mvn test -Dtest=DataQualityServiceTest
 
-# 仅 REST 集成测试（错误归类与 HTTP 状态码）
+# 仅新鲜度/迟到乱序/只读复盘测试（含 16 线程并发迟到提交与 300 批次复盘）
+mvn test -Dtest=FreshnessTimelinessTest
+
+# 仅 REST 集成测试（错误归类、HTTP 状态码与复盘端点）
 mvn test -Dtest=DataQualityControllerTest
 
 # 启动服务后配合上面的 curl 手工验证
 mvn spring-boot:run
 ```
 
-测试日志中会打印**批次标识、命中的规则（含版本）、measured/expected 与中文判定依据**，例如：
+测试日志中会打印**批次标识、业务时点、判定时刻、命中的规则（含版本）、measured/expected
+与中文判定依据**，例如：
 
 ```
 批次 b-fail 规则 r-id-complete v1 [COMPLETENESS] field=id passed=false
       measured=0.7500 expected=>=0.9900 依据=总行数=4，有效非空=3，空值=1，... 不达标
+批次 b-stale 规则 r-fresh v1 [FRESHNESS] passed=false measured=172800s expected=<=3600s
+      依据=业务时点=2026-10-02T08:00:00Z，判定时刻=2026-10-04T08:00:00Z，滞后=172800 秒，... 超出新鲜度窗口
 批次 b-concurrent 为重复提交（内容哈希一致），返回既有结论 status=FAILED，指标不重复累计
 ```
 
@@ -160,9 +225,26 @@ mvn spring-boot:run
 - 非法规则（阈值越界、取值域参数缺失、字段不在契约）与未知指标，均不静默跳过；
 - 完整性与唯一性失败原因可区分；
 - 告警 打开 → 合并 → 恢复 → 重新打开 完整流转；
-- 阈值变更产生新版本后，历史批次结论（含 v1 快照）仍可复现。
+- 阈值变更产生新版本后，历史批次结论（含 v1 快照）仍可复现；
+- 新鲜度：新鲜批次通过、陈旧/回填批次明确失败并打开告警；
+- 显式判定时刻下结论与判定依据可复现，重复提交返回完全一致结论；
+- 迟到乱序：已恢复告警不被业务时点更早的迟到批次拉回，更晚越界数据仍重开；
+- 迟到批次 16 线程并发重复提交：只评估一次、告警不重复累计、状态不倒退；
+- 只读复盘：按指定时刻重算越界情况，不改写批次结论与告警历史，重复复盘结果一致，
+  300 批次规模一次算完。
 
-## 9. 代码结构
+## 10. 兼容范围
+
+- **未携带 `businessTime` 的旧调用方**：业务时点回退为 `submittedAt`，其余行为不变；
+- **未携带 `evaluationTime` 的旧调用方**：判定时刻取系统当前时间。注意这与旧版
+  “参考时间恒等于 `submittedAt`（滞后恒 0）”的行为**有意不同**——旧行为下业务上很旧的
+  批次也会被判新鲜，本次修正后按真实滞后判定；
+- **历史规则版本**：复盘按各批次落库的规则快照取 `maxAgeSeconds`，规则变更不影响
+  历史批次的复盘口径；评估与复盘共用同一判定函数；
+- **存储**：进程内存储随重启清空，无持久化数据迁移问题；`Alert` 新增的水位字段
+  只影响新发生的流转，既有打开/恢复/重开语义不变。
+
+## 11. 代码结构
 
 ```
 model/      契约、规则、批次、结论、拒绝原因、告警等领域模型

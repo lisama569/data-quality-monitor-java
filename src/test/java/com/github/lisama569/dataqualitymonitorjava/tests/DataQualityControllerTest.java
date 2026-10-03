@@ -182,9 +182,55 @@ class DataQualityControllerTest {
     }
 
     @Test
+    @DisplayName("新鲜度复盘端点：按指定时刻返回越界情况且不改写历史；非法时刻返回 400")
+    void freshnessReviewEndpoint() throws Exception {
+        String cid = "it-contract-7";
+        registerContract(cid);
+        registerRule(cid, "r-fresh", "FRESHNESS", null, null, null, 3600L);
+        // 业务时点 T0，判定时刻显式指定为 T0（提交时新鲜度通过）。
+        String body = om.writeValueAsString(Map.of(
+                "batchId", "it-b7",
+                "contractId", cid,
+                "submittedAt", "2026-09-24T08:00:00Z",
+                "businessTime", "2026-09-24T08:00:00Z",
+                "evaluationTime", "2026-09-24T08:00:00Z",
+                "rows", List.of(Map.of("id", "1", "status", "NEW"))));
+        mockMvc.perform(post("/api/batches").contentType(MediaType.APPLICATION_JSON).content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PASSED"))
+                .andExpect(jsonPath("$.businessTime").value("2026-09-24T08:00:00Z"))
+                .andExpect(jsonPath("$.evaluatedAt").value("2026-09-24T08:00:00Z"));
+
+        // 以 T0+7200 复盘：滞后 7200 > 3600 -> 越界；同一时刻重复复盘结果一致。
+        String reviewPath = "/api/contracts/" + cid + "/freshness-review?at=2026-09-24T10:00:00Z";
+        String first = mockMvc.perform(get(reviewPath))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.contractId").value(cid))
+                .andExpect(jsonPath("$.reviewTime").value("2026-09-24T10:00:00Z"))
+                .andExpect(jsonPath("$.batchCount").value(1))
+                .andExpect(jsonPath("$.violatedCount").value(1))
+                .andExpect(jsonPath("$.entries[0].batchId").value("it-b7"))
+                .andExpect(jsonPath("$.entries[0].violated").value(true))
+                .andExpect(jsonPath("$.entries[0].assessments[0].lagSeconds").value(7200))
+                .andReturn().getResponse().getContentAsString();
+        String second = mockMvc.perform(get(reviewPath))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsString();
+        org.junit.jupiter.api.Assertions.assertEquals(first, second, "同一判定时刻重复复盘结果必须一致");
+
+        // 只读：批次结论仍为 PASSED，未被复盘改写。
+        mockMvc.perform(get("/api/batches/it-b7"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.status").value("PASSED"));
+
+        // 非法判定时刻 -> 400。
+        mockMvc.perform(get("/api/contracts/" + cid + "/freshness-review?at=not-a-time"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
     @DisplayName("告警接口能观察到 OPEN 状态")
-    void alertsObservable() throws Exception {
-        String cid = "it-contract-6";
+    void alertsObservable() throws Exception {        String cid = "it-contract-6";
         registerContract(cid);
         registerRule(cid, "r-id", "COMPLETENESS", "id", 1.0, null, null);
         String body = batchJson("it-b6", cid, List.of(

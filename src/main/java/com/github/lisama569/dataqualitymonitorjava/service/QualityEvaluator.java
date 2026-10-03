@@ -25,19 +25,32 @@ import java.util.Set;
 @Component
 public class QualityEvaluator {
 
-    /** 以 referenceTime 作为“当前时间”评估新鲜度，保证结论与时间相关时仍可复现。 */
+    /** 以 evaluationTime 作为“判定时刻”评估新鲜度：滞后 = 业务时点 -&gt; 判定时刻。
+     * 业务时点与判定时刻确定后结论即固定，不随运行时刻漂移。 */
     public List<RuleOutcome> evaluate(BatchSubmission submission, DataContract contract,
-                                      List<QualityRule> rules, Instant referenceTime) {
+                                      List<QualityRule> rules, Instant evaluationTime) {
         List<RuleOutcome> outcomes = new ArrayList<>();
         for (QualityRule rule : rules) {
             outcomes.add(switch (rule.getType()) {
                 case COMPLETENESS -> completeness(submission, contract, rule);
                 case UNIQUENESS -> uniqueness(submission, rule);
                 case VALUE_DOMAIN -> valueDomain(submission, contract, rule);
-                case FRESHNESS -> freshness(submission, rule, referenceTime);
+                case FRESHNESS -> freshnessOutcome(rule, submission.getBusinessTime(), evaluationTime);
             });
         }
         return outcomes;
+    }
+
+    /** 单条新鲜度规则的纯函数判定（评估与只读复盘共用同一口径，保证两处结论一致）。 */
+    public RuleOutcome freshnessOutcome(QualityRule rule, Instant businessTime, Instant evaluationTime) {
+        long ageSeconds = Duration.between(businessTime, evaluationTime).getSeconds();
+        long maxAge = rule.getMaxAgeSeconds();
+        boolean passed = ageSeconds <= maxAge;
+        String basis = String.format("业务时点=%s，判定时刻=%s，滞后=%d 秒，"
+                + "允许最大滞后=%d 秒，%s",
+                businessTime, evaluationTime, ageSeconds, maxAge,
+                passed ? "在新鲜度窗口内" : "超出新鲜度窗口");
+        return outcome(rule, passed, ageSeconds + "s", "<=" + maxAge + "s", basis);
     }
 
     private RuleOutcome completeness(BatchSubmission submission, DataContract contract, QualityRule rule) {
@@ -112,18 +125,6 @@ public class QualityEvaluator {
                 total, inDomain, outDomain, nullCount, ratio, expected, passed ? "达标" : "不达标");
         return outcome(rule, passed, String.format("%.4f", ratio),
                 String.format(">=%.4f", expected), basis);
-    }
-
-    private RuleOutcome freshness(BatchSubmission submission, QualityRule rule, Instant referenceTime) {
-        Instant submittedAt = submission.getSubmittedAt();
-        long ageSeconds = Duration.between(submittedAt, referenceTime).getSeconds();
-        long maxAge = rule.getMaxAgeSeconds();
-        boolean passed = ageSeconds <= maxAge;
-        String basis = String.format("批次提交时间=%s，评估参考时间=%s，滞后=%d 秒，"
-                + "允许最大滞后=%d 秒，%s",
-                submittedAt, referenceTime, ageSeconds, maxAge,
-                passed ? "在新鲜度窗口内" : "超出新鲜度窗口");
-        return outcome(rule, passed, ageSeconds + "s", "<=" + maxAge + "s", basis);
     }
 
     private boolean inAllowed(QualityRule rule, String value) {

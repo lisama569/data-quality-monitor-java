@@ -9,9 +9,11 @@ import com.github.lisama569.dataqualitymonitorjava.model.BatchSubmission;
 import com.github.lisama569.dataqualitymonitorjava.model.DataContract;
 import com.github.lisama569.dataqualitymonitorjava.model.DataRow;
 import com.github.lisama569.dataqualitymonitorjava.model.FieldSchema;
+import com.github.lisama569.dataqualitymonitorjava.model.FreshnessReview;
 import com.github.lisama569.dataqualitymonitorjava.model.QualityRule;
 import com.github.lisama569.dataqualitymonitorjava.model.RejectReason;
 import com.github.lisama569.dataqualitymonitorjava.model.RuleOutcome;
+import com.github.lisama569.dataqualitymonitorjava.model.RuleType;
 import com.github.lisama569.dataqualitymonitorjava.storage.LocalStorage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,6 +21,7 @@ import org.springframework.stereotype.Service;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
@@ -96,6 +99,11 @@ public class DataQualityService {
         String batchId = submission.getBatchId();
         Object lock = batchLocks.computeIfAbsent(batchId, k -> new Object());
         synchronized (lock) {
+            // 判定时刻：调用方显式指定则使用（复盘/测试），否则取系统当前时间。
+            // 一旦确定即随结论持久化，同一业务时点+判定时刻的结论不随运行时刻漂移。
+            Instant evaluationTime = submission.getEvaluationTime() != null
+                    ? submission.getEvaluationTime() : Instant.now();
+
             // 1. 并发/重复提交：锁内再次确认，确保只评估一次。
             Optional<BatchResult> existing = storage.findBatch(batchId);
             String hash = contentHasher.hash(submission);
@@ -107,9 +115,9 @@ public class DataQualityService {
                     // 存储中的唯一结论保持不变；仅在本次响应上标记 duplicate，便于调用方识别。
                     return new BatchResult(prior.getBatchId(), prior.getContractId(), prior.getStatus(),
                             prior.getContentHash(), true, prior.getRejections(), prior.getOutcomes(),
-                            prior.getRuleSnapshots(), prior.getEvaluatedAt());
+                            prior.getRuleSnapshots(), prior.getBusinessTime(), prior.getEvaluatedAt());
                 }
-                return reject(submission, hash, false, List.of(new BatchResult.Rejection(
+                return reject(submission, hash, evaluationTime, List.of(new BatchResult.Rejection(
                         RejectReason.DUPLICATE_ID_CONTENT_CONFLICT,
                         "既有内容哈希=" + prior.getContentHash() + "，本次内容哈希=" + hash)));
             }
@@ -117,18 +125,20 @@ public class DataQualityService {
             // 2. 前置校验，汇总全部拒绝原因（不静默跳过任何一类问题）。
             List<BatchResult.Rejection> rejections = preCheck(submission, hash);
             if (!rejections.isEmpty()) {
-                return reject(submission, hash, false, rejections);
+                return reject(submission, hash, evaluationTime, rejections);
             }
 
-            // 3. 评估（新鲜度参考时间取批次提交时间，保证历史结论可复现）。
+            // 3. 评估。新鲜度滞后 = 批次业务时点 -> 判定时刻；
+            // 判定时刻随结论落库，历史批次无论何时复查结论都可复现。
             DataContract contract = storage.findContract(submission.getContractId()).orElseThrow();
             List<QualityRule> rules = storage.listLatestRulesForContract(submission.getContractId());
             List<RuleOutcome> outcomes =
-                    evaluator.evaluate(submission, contract, rules, submission.getSubmittedAt());
+                    evaluator.evaluate(submission, contract, rules, evaluationTime);
             boolean allPassed = outcomes.stream().allMatch(RuleOutcome::isPassed);
             BatchStatus status = allPassed ? BatchStatus.PASSED : BatchStatus.FAILED;
             BatchResult result = new BatchResult(batchId, submission.getContractId(), status, hash,
-                    false, List.of(), List.copyOf(outcomes), List.copyOf(rules), Instant.now());
+                    false, List.of(), List.copyOf(outcomes), List.copyOf(rules),
+                    submission.getBusinessTime(), evaluationTime);
             storage.saveBatch(result);
 
             log.info("批次 {} 评估完成 status={} 命中规则数={}", batchId, status, outcomes.size());
@@ -196,11 +206,11 @@ public class DataQualityService {
         return rejections;
     }
 
-    private BatchResult reject(BatchSubmission submission, String hash, boolean duplicate,
+    private BatchResult reject(BatchSubmission submission, String hash, Instant evaluationTime,
                                List<BatchResult.Rejection> rejections) {
         BatchResult result = new BatchResult(submission.getBatchId(), submission.getContractId(),
-                BatchStatus.REJECTED, hash, duplicate, List.copyOf(rejections),
-                List.of(), List.of(), Instant.now());
+                BatchStatus.REJECTED, hash, false, List.copyOf(rejections),
+                List.of(), List.of(), submission.getBusinessTime(), evaluationTime);
         storage.saveBatch(result);
         for (BatchResult.Rejection r : rejections) {
             log.warn("批次 {} 被拒绝 reason={} detail={}",
@@ -221,6 +231,46 @@ public class DataQualityService {
 
     public List<Alert> listAlerts() {
         return alertService.list();
+    }
+
+    /**
+     * 只读复盘：以 reviewTime 为判定时刻，对该契约下全部已评估批次（REJECTED 除外）
+     * 按其落库的业务时点与规则版本快照重算新鲜度结论与越界情况。
+     * 只产出派生视图，不改写批次结论、告警状态与流转历史；
+     * 同一 reviewTime 重复调用结果完全一致。
+     */
+    public FreshnessReview reviewFreshness(String contractId, Instant reviewTime) {
+        List<BatchResult> batches = storage.listBatches().stream()
+                .filter(b -> contractId.equals(b.getContractId()))
+                .filter(b -> b.getStatus() != BatchStatus.REJECTED)
+                .sorted(Comparator.comparing(BatchResult::getBusinessTime)
+                        .thenComparing(BatchResult::getBatchId))
+                .toList();
+        List<FreshnessReview.Entry> entries = new ArrayList<>(batches.size());
+        int violated = 0;
+        for (BatchResult batch : batches) {
+            List<FreshnessReview.Assessment> assessments = new ArrayList<>();
+            for (QualityRule rule : batch.getRuleSnapshots()) {
+                if (rule.getType() != RuleType.FRESHNESS) {
+                    continue;
+                }
+                RuleOutcome o = evaluator.freshnessOutcome(rule, batch.getBusinessTime(), reviewTime);
+                assessments.add(new FreshnessReview.Assessment(o.getRuleId(), o.getRuleVersion(),
+                        Long.parseLong(o.getMeasured().replace("s", "")), rule.getMaxAgeSeconds(),
+                        o.isPassed(), o.getBasis()));
+            }
+            boolean entryViolated = assessments.stream().anyMatch(a -> !a.passed());
+            if (entryViolated) {
+                violated++;
+            }
+            entries.add(new FreshnessReview.Entry(batch.getBatchId(), batch.getStatus(),
+                    batch.getBusinessTime(), batch.getEvaluatedAt(), entryViolated,
+                    List.copyOf(assessments)));
+        }
+        log.info("契约 {} 新鲜度复盘 reviewTime={} 覆盖批次={} 越界批次={}（只读，不改写历史）",
+                contractId, reviewTime, batches.size(), violated);
+        return new FreshnessReview(contractId, reviewTime, batches.size(), violated,
+                List.copyOf(entries));
     }
 
     /** 清空本地存储（契约/规则/批次/告警），供本地验证与测试重置。 */

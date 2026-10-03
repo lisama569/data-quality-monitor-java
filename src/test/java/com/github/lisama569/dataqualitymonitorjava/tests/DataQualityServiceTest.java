@@ -116,8 +116,9 @@ class DataQualityServiceTest {
         service.registerValidatedRule(rule("r-fresh", RuleType.FRESHNESS, null,
                 null, null, null, null, 3600L));
 
-        BatchResult result = service.submit(batch("b-pass", T0, List.of(
-                row(1, "NEW", "10.0"), row(2, "PAID", "20.0"))));
+        // 显式指定判定时刻 = 业务时点（缺省回退 submittedAt=T0），滞后 0 秒，新鲜度通过。
+        BatchResult result = service.submit(new BatchSubmission("b-pass", CONTRACT, T0, null, T0,
+                List.of(row(1, "NEW", "10.0"), row(2, "PAID", "20.0"))));
         printResult(result);
 
         assertEquals(BatchStatus.PASSED, result.getStatus());
