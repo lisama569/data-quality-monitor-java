@@ -26,9 +26,10 @@ import java.util.stream.Collectors;
  *   <li>RESOLVED 后再次失败：重新 OPEN，openCount+1，记录 RESOLVED -&gt; OPEN。</li>
  * </ul>
  * <b>业务时点水位（迟到/回填保护）</b>：每条告警记录已处理批次中最晚的业务时点。
- * 业务时点不晚于水位的迟到批次，无论越界与否都<b>不得翻转</b>已恢复/已打开的状态、
- * 不累计 occurrence/openCount，仅追加一条同态的“迟到抑制”流转记录留痕；
- * 业务时点确实更晚且越界的数据，仍按原有合并/重开规则流转。
+ * 只有业务时点<b>严格更早</b>于水位的迟到批次才被抑制：无论越界与否都<b>不得翻转</b>
+ * 已恢复/已打开的状态、不累计 occurrence/openCount，仅追加一条同态的“迟到抑制”流转记录留痕；
+ * 业务时点与水位<b>相同</b>的批次（业务时点常按整天/整点取整，同一时点会连续到达多个批次）
+ * 照常参与打开、合并、恢复、重开；业务时点确实更晚且越界的数据，同样按原有规则流转。
  * 所有流转都追加到 transitions，保证历史可追溯。
  */
 @Component
@@ -61,9 +62,10 @@ public class AlertService {
             }
             Alert current = storage.findAlert(rule.getRuleId()).orElse(null);
 
-            // 迟到/回填保护：业务时点不晚于已处理水位时，禁止状态翻转与计数累计。
+            // 迟到/回填保护：仅当业务时点严格更早于已处理水位时，才禁止状态翻转与计数累计；
+            // 业务时点与水位相同的批次照常流转（同一业务时点会连续到达多个批次）。
             if (current != null && current.getWatermarkBusinessTime() != null
-                    && !businessTime.isAfter(current.getWatermarkBusinessTime())) {
+                    && businessTime.isBefore(current.getWatermarkBusinessTime())) {
                 Alert suppressed = suppressLate(current, at, batchId, businessTime, outcome.isPassed());
                 storage.saveAlert(suppressed);
                 touched.add(suppressed);
@@ -105,7 +107,7 @@ public class AlertService {
         String verb = passed ? "指标已通过" : "再次越界";
         transitions.add(new AlertTransition(at, batchId, current.getState(), current.getState(),
                 "迟到/回填批次 " + batchId + "（业务时点=" + businessTime
-                        + "）不晚于已处理水位 " + current.getWatermarkBusinessTime()
+                        + "）早于已处理水位 " + current.getWatermarkBusinessTime()
                         + "，" + verb + "，按业务时序抑制：不翻转告警、不累计次数"));
         return new Alert(current.getAlertKey(), current.getRuleId(), current.getState(),
                 current.getFirstBatchId(), current.getLastBatchId(),

@@ -1,5 +1,7 @@
 package com.github.lisama569.dataqualitymonitorjava.model;
 
+import java.util.Objects;
+
 /** 单条规则对单个批次的判定结论，measured/expected/basis 用于可复现的判定依据。 */
 public final class RuleOutcome {
 
@@ -32,4 +34,39 @@ public final class RuleOutcome {
     public String getMeasured() { return measured; }
     public String getExpected() { return expected; }
     public String getBasis() { return basis; }
+
+    /**
+     * 值对象相等：全部判定字段逐字一致才算相等。
+     * 使 ReplayReport/ReplayBatchView（record）内嵌的结论列表可直接参与 equals 比较，
+     * 同一判定时刻重复复盘返回的报告能直接判等，便于去重与比对。
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) {
+            return true;
+        }
+        if (!(o instanceof RuleOutcome other)) {
+            return false;
+        }
+        return ruleVersion == other.ruleVersion && passed == other.passed
+                && Objects.equals(ruleId, other.ruleId)
+                && ruleType == other.ruleType
+                && Objects.equals(fieldName, other.fieldName)
+                && Objects.equals(measured, other.measured)
+                && Objects.equals(expected, other.expected)
+                && Objects.equals(basis, other.basis);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(ruleId, ruleVersion, ruleType, fieldName, passed,
+                measured, expected, basis);
+    }
+
+    @Override
+    public String toString() {
+        return "RuleOutcome{ruleId=" + ruleId + ", v" + ruleVersion + ", " + ruleType
+                + ", field=" + fieldName + ", passed=" + passed
+                + ", measured=" + measured + ", expected=" + expected + '}';
+    }
 }

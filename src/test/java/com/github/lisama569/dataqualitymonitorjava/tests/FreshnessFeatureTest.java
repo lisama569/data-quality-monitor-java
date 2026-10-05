@@ -87,32 +87,255 @@ class FreshnessFeatureTest {
                 .filter(o -> o.getRuleType() == RuleType.FRESHNESS).findFirst().orElseThrow();
     }
 
-    /** RuleOutcome 为不可变值对象但未实现 equals，按全部字段逐字比较两份复盘报告。 */
-    private static void assertReportEquals(ReplayReport a, ReplayReport b, String message) {
-        assertEquals(a.contractId(), b.contractId(), message);
-        assertEquals(a.judgedAt(), b.judgedAt(), message);
-        assertEquals(a.batchCount(), b.batchCount(), message);
-        assertEquals(a.violatingBatchCount(), b.violatingBatchCount(), message);
-        assertEquals(a.batches().size(), b.batches().size(), message);
-        for (int i = 0; i < a.batches().size(); i++) {
-            ReplayBatchView va = a.batches().get(i);
-            ReplayBatchView vb = b.batches().get(i);
-            assertEquals(va.batchId(), vb.batchId(), message);
-            assertEquals(va.businessTime(), vb.businessTime(), message);
-            assertEquals(va.carriedStatus(), vb.carriedStatus(), message);
-            assertEquals(va.violatedRuleIds(), vb.violatedRuleIds(), message);
-            assertEquals(va.freshnessOutcomes().size(), vb.freshnessOutcomes().size(), message);
-            for (int j = 0; j < va.freshnessOutcomes().size(); j++) {
-                RuleOutcome oa = va.freshnessOutcomes().get(j);
-                RuleOutcome ob = vb.freshnessOutcomes().get(j);
-                assertEquals(oa.getRuleId(), ob.getRuleId(), message);
-                assertEquals(oa.getRuleVersion(), ob.getRuleVersion(), message);
-                assertEquals(oa.isPassed(), ob.isPassed(), message);
-                assertEquals(oa.getMeasured(), ob.getMeasured(), message);
-                assertEquals(oa.getExpected(), ob.getExpected(), message);
-                assertEquals(oa.getBasis(), ob.getBasis(), message);
-            }
+    @Test
+    @DisplayName("同一业务时点连续到达：越界打开 -> 同时点越界合并 -> 同时点通过恢复 -> 同时点越界重开")
+    void sameBusinessTimeBatchesParticipateInTransitions() {
+        // 业务时点按整点取整，同一时点 T0 连续到达 4 个批次
+        Instant biz = T0;
+        // 1) 越界（滞后 2h）：首次打开
+        BatchResult r1 = service.submit(batch("s-1", biz, T0.plusSeconds(2 * 3600)),
+                T0.plusSeconds(2 * 3600));
+        assertEquals(BatchStatus.FAILED, r1.getStatus());
+        Alert a1 = service.listAlerts().get(0);
+        assertEquals(AlertState.OPEN, a1.getState());
+        assertEquals(1, a1.getOccurrenceCount());
+        assertEquals(1, a1.getOpenCount());
+        assertEquals(biz, a1.getWatermarkBusinessTime());
+
+        // 2) 同一业务时点再越界（滞后 3h）：必须合并累计，而不是被水位抑制
+        BatchResult r2 = service.submit(batch("s-2", biz, T0.plusSeconds(3 * 3600)),
+                T0.plusSeconds(3 * 3600));
+        assertEquals(BatchStatus.FAILED, r2.getStatus());
+        Alert a2 = service.listAlerts().get(0);
+        assertEquals(AlertState.OPEN, a2.getState(), "同时点越界应合并到既有告警");
+        assertEquals(2, a2.getOccurrenceCount(), "同时点越界必须累计越界次数");
+        assertEquals(1, a2.getOpenCount(), "合并不重复打开");
+        assertEquals("s-2", a2.getLastBatchId());
+
+        // 3) 同一业务时点通过（滞后 30min）：必须把已打开的告警恢复关闭
+        BatchResult r3 = service.submit(batch("s-3", biz, T0.plusSeconds(1800)),
+                T0.plusSeconds(1800));
+        assertEquals(BatchStatus.PASSED, r3.getStatus());
+        Alert a3 = service.listAlerts().get(0);
+        assertEquals(AlertState.RESOLVED, a3.getState(), "同时点通过必须恢复关闭告警");
+        assertEquals(2, a3.getOccurrenceCount(), "通过不累计越界次数");
+        assertEquals(1, a3.getOpenCount());
+
+        // 4) 同一业务时点再越界（滞后 2h）：必须能重新打开，不能卡在已恢复
+        BatchResult r4 = service.submit(batch("s-4", biz, T0.plusSeconds(2 * 3600)),
+                T0.plusSeconds(2 * 3600));
+        assertEquals(BatchStatus.FAILED, r4.getStatus());
+        Alert a4 = service.listAlerts().get(0);
+        assertEquals(AlertState.OPEN, a4.getState(), "同时点再越界必须重新打开");
+        assertEquals(3, a4.getOccurrenceCount());
+        assertEquals(2, a4.getOpenCount(), "重开必须累计打开次数");
+        assertEquals("s-4", a4.getLastBatchId());
+
+        long suppressed = a4.getTransitions().stream()
+                .filter(t -> t.note() != null && t.note().contains("抑制")).count();
+        assertEquals(0, suppressed, "同一业务时点不属于迟到，不得产生抑制记录");
+        // 完整流转：打开 -> 合并 -> 恢复 -> 重开
+        assertEquals(4, a4.getTransitions().size());
+        log.info("[同时点流转] transitions={}", a4.getTransitions().stream()
+                .map(t -> t.from() + "->" + t.to() + "@" + t.batchId()).toList());
+    }
+
+    @Test
+    @DisplayName("迟到抑制边界：业务时点早 1 秒才抑制（越界与通过都抑制），等于水位照常流转，晚 1 秒重开")
+    void lateSuppressionBoundaryIsStrictlyEarlier() {
+        // 基准：业务 T0 越界打开，水位 = T0
+        service.submit(batch("t-base", T0, T0.plusSeconds(2 * 3600)), T0.plusSeconds(2 * 3600));
+        Alert opened = service.listAlerts().get(0);
+        assertEquals(AlertState.OPEN, opened.getState());
+        assertEquals(T0, opened.getWatermarkBusinessTime());
+
+        // 早 1 秒的越界批次：抑制，状态/计数/最近批次均不变，仅留痕
+        BatchResult earlyFail = service.submit(batch("t-early-fail", T0.minusSeconds(1),
+                T0.plusSeconds(3 * 3600)), T0.plusSeconds(3 * 3600));
+        assertEquals(BatchStatus.FAILED, earlyFail.getStatus(), "迟到批次自身结论仍按业务时点判定");
+        Alert afterEarlyFail = service.listAlerts().get(0);
+        assertEquals(AlertState.OPEN, afterEarlyFail.getState());
+        assertEquals(1, afterEarlyFail.getOccurrenceCount(), "抑制不得累计越界次数");
+        assertEquals(1, afterEarlyFail.getOpenCount(), "抑制不得累计打开次数");
+        assertEquals("t-base", afterEarlyFail.getLastBatchId(), "最近批次不得被迟到批次覆盖");
+        assertEquals(T0, afterEarlyFail.getWatermarkBusinessTime(), "水位不得被迟到批次回退");
+        assertEquals(1, afterEarlyFail.getTransitions().stream()
+                .filter(t -> t.note() != null && t.note().contains("抑制")).count());
+
+        // 等于水位的通过批次：照常流转，恢复关闭
+        service.submit(batch("t-equal-pass", T0, T0.plusSeconds(1800)), T0.plusSeconds(1800));
+        Alert afterEqualPass = service.listAlerts().get(0);
+        assertEquals(AlertState.RESOLVED, afterEqualPass.getState(), "等于水位不算迟到，必须照常恢复");
+
+        // 早 1 秒的通过批次：同样抑制，不得改动已恢复状态与任何计数
+        BatchResult earlyPass = service.submit(batch("t-early-pass", T0.minusSeconds(1),
+                T0.minusSeconds(1800)), T0.minusSeconds(1800));
+        assertEquals(BatchStatus.PASSED, earlyPass.getStatus());
+        Alert afterEarlyPass = service.listAlerts().get(0);
+        assertEquals(AlertState.RESOLVED, afterEarlyPass.getState());
+        assertEquals(1, afterEarlyPass.getOccurrenceCount());
+        assertEquals(1, afterEarlyPass.getOpenCount());
+        assertEquals("t-equal-pass", afterEarlyPass.getLastBatchId());
+        assertEquals(2, afterEarlyPass.getTransitions().stream()
+                .filter(t -> t.note() != null && t.note().contains("抑制")).count(),
+                "越界与通过的迟到批次各留一条抑制记录");
+
+        // 晚 1 秒的越界批次：业务时序更晚，必须重新打开
+        service.submit(batch("t-later-fail", T0.plusSeconds(1), T0.plusSeconds(2 * 3600)),
+                T0.plusSeconds(2 * 3600));
+        Alert afterLater = service.listAlerts().get(0);
+        assertEquals(AlertState.OPEN, afterLater.getState(), "更晚业务时点越界必须重开");
+        assertEquals(2, afterLater.getOccurrenceCount());
+        assertEquals(2, afterLater.getOpenCount());
+        assertEquals(T0.plusSeconds(1), afterLater.getWatermarkBusinessTime());
+        log.info("[抑制边界] transitions={}", afterLater.getTransitions().stream()
+                .map(t -> t.from() + "->" + t.to() + "@" + t.batchId()).toList());
+    }
+
+    @Test
+    @DisplayName("不同 batchId 的迟到批次并发提交：各自只真实处理一次，抑制留痕与批次一一对应，计数零累计")
+    void concurrentDistinctLateBatchesEachSuppressedOnce() throws Exception {
+        // 先让规则经历 打开(业务08:00) -> 恢复(业务11:00)，水位 = 11:00
+        service.submit(batch("g-0800", T0.minusSeconds(2 * 3600), T0), T0);
+        service.submit(batch("g-1100", T0.plusSeconds(3600), T0.plusSeconds(5400)),
+                T0.plusSeconds(5400));
+
+        int threads = 10;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        ConcurrentLinkedQueue<BatchResult> results = new ConcurrentLinkedQueue<>();
+        for (int i = 0; i < threads; i++) {
+            String batchId = "g-late-" + i;
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    // 不同 batchId、同一迟到业务时点 09:00（早于水位），均越界
+                    results.add(service.submit(
+                            batch(batchId, T0.minusSeconds(3600), T0.plusSeconds(2 * 3600)),
+                            T0.plusSeconds(2 * 3600)));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
         }
+        start.countDown();
+        assertTrue(done.await(10, TimeUnit.SECONDS));
+        pool.shutdown();
+
+        assertEquals(threads, results.size());
+        assertEquals(2 + threads, service.listBatches().size(), "每个迟到批次真实落库一次");
+        assertTrue(results.stream().allMatch(r -> r.getStatus() == BatchStatus.FAILED));
+        assertTrue(results.stream().noneMatch(BatchResult::isDuplicate));
+
+        Alert alert = service.listAlerts().get(0);
+        assertEquals(AlertState.RESOLVED, alert.getState(), "并发迟到不得翻转已恢复状态");
+        assertEquals(1, alert.getOccurrenceCount(), "并发迟到不得累计越界次数");
+        assertEquals(1, alert.getOpenCount(), "并发迟到不得累计打开次数");
+        assertEquals("g-1100", alert.getLastBatchId(), "最近批次不得被迟到批次覆盖");
+        long suppressed = alert.getTransitions().stream()
+                .filter(t -> t.note() != null && t.note().contains("抑制")).count();
+        assertEquals(threads, suppressed, "每个真实迟到批次恰好一条抑制留痕，不多不少");
+        log.info("[并发迟到-多批次] 批次数={} 抑制记录={} 状态={}",
+                results.size(), suppressed, alert.getState());
+    }
+
+    @Test
+    @DisplayName("同一迟到批次并发提交后再次重复提交：结论不漂移，仍只有一条抑制记录")
+    void repeatedLateSubmissionAfterConcurrencyStaysStable() throws Exception {
+        service.submit(batch("h-0800", T0.minusSeconds(2 * 3600), T0), T0);
+        service.submit(batch("h-1100", T0.plusSeconds(3600), T0.plusSeconds(5400)),
+                T0.plusSeconds(5400));
+
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch done = new CountDownLatch(threads);
+        ConcurrentLinkedQueue<BatchResult> results = new ConcurrentLinkedQueue<>();
+        for (int i = 0; i < threads; i++) {
+            pool.submit(() -> {
+                try {
+                    start.await();
+                    results.add(service.submit(
+                            batch("h-late", T0.minusSeconds(3600), T0.plusSeconds(2 * 3600)),
+                            T0.plusSeconds(2 * 3600)));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                } finally {
+                    done.countDown();
+                }
+            });
+        }
+        start.countDown();
+        assertTrue(done.await(10, TimeUnit.SECONDS));
+        pool.shutdown();
+
+        // 并发过后再顺序重复提交两次：仍返回既有结论
+        BatchResult again1 = service.submit(
+                batch("h-late", T0.minusSeconds(3600), T0.plusSeconds(2 * 3600)),
+                T0.plusSeconds(2 * 3600));
+        BatchResult again2 = service.submit(
+                batch("h-late", T0.minusSeconds(3600), T0.plusSeconds(2 * 3600)),
+                T0.plusSeconds(2 * 3600));
+        assertTrue(again1.isDuplicate() && again2.isDuplicate());
+        assertEquals(results.stream().filter(r -> !r.isDuplicate()).count(), 1,
+                "并发提交中只有一个是真实评估");
+        assertEquals(again1.getStatus(), again2.getStatus());
+        assertEquals(again1.getOutcomes().get(0).getBasis(), again2.getOutcomes().get(0).getBasis(),
+                "重复提交结论依据不漂移");
+
+        Alert alert = service.listAlerts().get(0);
+        assertEquals(AlertState.RESOLVED, alert.getState());
+        assertEquals(1, alert.getOccurrenceCount());
+        assertEquals(1, alert.getOpenCount());
+        long suppressed = alert.getTransitions().stream()
+                .filter(t -> t.note() != null && t.note().contains("抑制")).count();
+        assertEquals(1, suppressed, "并发+重复提交全程只允许一条抑制留痕");
+        log.info("[并发+重复迟到] 抑制记录={} 告警状态={}", suppressed, alert.getState());
+    }
+
+    @Test
+    @DisplayName("同一判定时刻重复复盘：报告内容一致且可直接判等（equals/hashCode），全程只读")
+    void repeatedReplayReportsAreDirectlyEqualAndReadOnly() {
+        // 准备 3 个批次：越界、通过、再越界，告警经历完整流转
+        service.submit(batch("r-1", T0.minusSeconds(2 * 3600), T0), T0);
+        service.submit(batch("r-2", T0.plusSeconds(1800), T0.plusSeconds(1810)),
+                T0.plusSeconds(1810));
+        service.submit(batch("r-3", T0.plusSeconds(3600), T0.plusSeconds(3 * 3600)),
+                T0.plusSeconds(3 * 3600));
+
+        // 快照复盘前状态
+        int batchesBefore = service.listBatches().size();
+        Alert alertBefore = service.listAlerts().get(0);
+        int transitionsBefore = alertBefore.getTransitions().size();
+        int occurrenceBefore = alertBefore.getOccurrenceCount();
+
+        Instant judgedAt = T0.plusSeconds(2 * 3600);
+        ReplayReport first = service.replay(CONTRACT, judgedAt);
+        ReplayReport second = service.replay(CONTRACT, judgedAt);
+        ReplayReport third = service.replay(CONTRACT, judgedAt);
+
+        // 报告本身直接判等：便于去重与比对（RuleOutcome 已实现值相等）
+        assertEquals(first, second, "同一判定时刻重复复盘报告必须直接判等");
+        assertEquals(second, third);
+        assertEquals(first.hashCode(), second.hashCode(), "相等报告的 hashCode 必须一致");
+        assertNotSame(first, second, "每次复盘返回独立报告对象");
+        assertEquals(3, first.batchCount());
+        assertEquals(2, first.violatingBatchCount());
+
+        // 只读：批次结论、告警状态、计数与流转历史零改动
+        assertEquals(batchesBefore, service.listBatches().size());
+        Alert alertAfter = service.listAlerts().get(0);
+        assertEquals(alertBefore.getState(), alertAfter.getState());
+        assertEquals(occurrenceBefore, alertAfter.getOccurrenceCount());
+        assertEquals(transitionsBefore, alertAfter.getTransitions().size());
+        assertEquals(alertBefore.getWatermarkBusinessTime(), alertAfter.getWatermarkBusinessTime(),
+                "复盘不得推进业务时点水位");
+        log.info("[复盘判等] 报告相等={} 越界批次={} 流转数={}",
+                first.equals(second), first.violatingBatchCount(),
+                alertAfter.getTransitions().size());
     }
 
     @Test
@@ -285,7 +508,8 @@ class FreshnessFeatureTest {
 
         assertEquals(2, r1.batchCount());
         assertEquals(1, r1.violatingBatchCount());
-        assertReportEquals(r1, r2, "同一判定时刻重复复盘结果必须一致");
+        assertEquals(r1, r2, "同一判定时刻重复复盘结果必须一致且可直接判等");
+        assertEquals(r1.hashCode(), r2.hashCode());
 
         Map<String, ReplayBatchView> byId = new HashMap<>();
         r1.batches().forEach(v -> byId.put(v.batchId(), v));
