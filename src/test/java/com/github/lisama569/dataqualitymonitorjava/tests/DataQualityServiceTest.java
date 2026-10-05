@@ -25,6 +25,7 @@ import com.github.lisama569.dataqualitymonitorjava.storage.LocalStorage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,6 +46,7 @@ import static org.junit.jupiter.api.Assertions.*;
  * 数据质量服务核心场景测试。
  * 每个测试都会在日志中打印批次标识、命中的规则与判定依据（由服务层输出）。
  */
+@ExtendWith(BusinessCoverageLoggingExtension.class)
 class DataQualityServiceTest {
 
     private static final Logger log = LoggerFactory.getLogger(DataQualityServiceTest.class);

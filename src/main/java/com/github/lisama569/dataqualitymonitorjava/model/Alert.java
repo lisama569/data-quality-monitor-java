@@ -18,7 +18,9 @@ public final class Alert {
     private final List<AlertTransition> transitions;
     /**
      * 已处理批次中最晚的业务时点水位。
-     * 业务时点不晚于该水位的迟到批次不得再翻转（打开/关闭）本告警，只能留下抑制记录。
+     * 只有业务时点严格更早（&lt; 水位）的迟到批次才被抑制：不得翻转（打开/关闭）本告警、
+     * 不累计次数、不更新最近批次，只能留下一条抑制记录；业务时点等于水位（同一业务时点
+     * 连续到达的多个批次）照常参与打开、合并、恢复、重开。
      */
     private final Instant watermarkBusinessTime;
 
